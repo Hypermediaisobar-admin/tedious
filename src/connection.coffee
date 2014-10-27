@@ -262,8 +262,8 @@ class Connection extends EventEmitter
     @config.options ||= {}
     @config.options.textsize ||= DEFAULT_TEXTSIZE
     @config.options.connectTimeout ||= DEFAULT_CONNECT_TIMEOUT
-    @config.options.requestTimeout ||= DEFAULT_CLIENT_REQUEST_TIMEOUT
-    @config.options.cancelTimeout ||= DEFAULT_CANCEL_TIMEOUT
+    @config.options.requestTimeout ?= DEFAULT_CLIENT_REQUEST_TIMEOUT
+    @config.options.cancelTimeout ?= DEFAULT_CANCEL_TIMEOUT
     @config.options.packetSize ||= DEFAULT_PACKET_SIZE
     @config.options.tdsVersion ||= DEFAULT_TDS_VERSION
     @config.options.isolationLevel ||= ISOLATION_LEVEL.READ_COMMITTED
@@ -279,8 +279,11 @@ class Connection extends EventEmitter
     else if @config.options.port && @config.options.instanceName
       throw new Error("Port and instanceName are mutually exclusive, but #{@config.options.port} and #{@config.options.instanceName} provided")
     else if @config.options.port
-      if @config.options.port < 0 or @config.options.port > 65536
+      if @config.options.port < 0 or @config.options.port > 65536
         throw new RangeError "Port should be > 0 and < 65536"
+    
+    if @config.options.columnNameReplacer && typeof @config.options.columnNameReplacer != 'function'
+      throw new TypeError('options.columnNameReplacer must be a function or null.')
 
   createDebug: ->
     @debug = new Debug(@config.options.debug)
@@ -370,8 +373,11 @@ class Connection extends EventEmitter
     )
     @tokenStreamParser.on('row', (token) =>
       if @request
-        if @config.options.rowCollectionOnRequestCompletion || @config.options.rowCollectionOnDone
+        if @config.options.rowCollectionOnRequestCompletion
           @request.rows.push token.columns
+        
+        if @config.options.rowCollectionOnDone
+          @request.rst.push token.columns
 
         @request.emit('row', token.columns)
       else
@@ -389,24 +395,24 @@ class Connection extends EventEmitter
     )
     @tokenStreamParser.on('doneProc', (token) =>
       if @request
-        @request.emit('doneProc', token.rowCount, token.more, @procReturnStatusValue, @request.rows)
+        @request.emit('doneProc', token.rowCount, token.more, @procReturnStatusValue, @request.rst)
         @procReturnStatusValue = undefined
 
         if token.rowCount != undefined
           @request.rowCount += token.rowCount
 
         if @config.options.rowCollectionOnDone
-          @request.rows = []
+          @request.rst = []
     )
     @tokenStreamParser.on('doneInProc', (token) =>
       if @request
-        @request.emit('doneInProc', token.rowCount, token.more, @request.rows)
+        @request.emit('doneInProc', token.rowCount, token.more, @request.rst)
 
         if token.rowCount != undefined
           @request.rowCount += token.rowCount
 
         if @config.options.rowCollectionOnDone
-          @request.rows = []
+          @request.rst = []
     )
     @tokenStreamParser.on('done', (token) =>
       if @request
@@ -417,13 +423,13 @@ class Connection extends EventEmitter
         if token.sqlError && !@request.error
           @request.error = RequestError('An unknown error has occurred.', 'UNKNOWN')
 
-        @request.emit('done', token.rowCount, token.more, @request.rows)
+        @request.emit('done', token.rowCount, token.more, @request.rst)
 
         if token.rowCount != undefined
           @request.rowCount += token.rowCount
 
         if @config.options.rowCollectionOnDone
-          @request.rows = []
+          @request.rst = []
     )
     @tokenStreamParser.on('resetConnection', (token) =>
       @emit('resetConnection')
@@ -437,17 +443,29 @@ class Connection extends EventEmitter
     if (@config.options.port)
       @connectOnPort(@config.options.port)
     else
-      instanceLookup(@config.server, @config.options.instanceName, (message, port) =>
-        if message
-          @emit('connect', ConnectionError(message, 'EINSTLOOKUP'))
-        else
-          @connectOnPort(port)
-      )
+      instanceLookup(
+        @config.server
+        @config.options.instanceName
+        (message, port) =>
+          if @state == @STATE.FINAL
+            return
+          if message
+            @emit('connect', ConnectionError(message, 'EINSTLOOKUP'))
+          else
+            @connectOnPort(port)
+        @config.options.connectTimeout)
 
   connectOnPort: (port) ->
     @socket = new Socket({})
-    @socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY)
-    @socket.connect(port, @config.server)
+
+    connectOpts =
+      host: @config.server
+      port: port
+
+    if @config.options.localAddress
+      connectOpts.localAddress = @config.options.localAddress
+
+    @socket.connect(connectOpts)
     @socket.on('error', @socketError)
     @socket.on('connect', @socketConnect)
     @socket.on('close', @socketClose)
@@ -525,6 +543,7 @@ class Connection extends EventEmitter
     @dispatchEvent('socketError', error)
 
   socketConnect: =>
+    @socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY)
     @closed = false
     @debug.log("connected to #{@config.server}:#{@config.options.port}")
     @dispatchEvent('socketConnect')
@@ -631,6 +650,7 @@ class Connection extends EventEmitter
     @messageIo.sendMessage(TYPE.SQL_BATCH, payload.data)
 
   getInitialSql: ->
+    xact_abort = if @config.options.abortTransactionOnError then 'on' else 'off'
     """set textsize #{@config.options.textsize}
 set quoted_identifier on
 set arithabort off
@@ -644,7 +664,8 @@ set implicit_transactions off
 set language us_english
 set dateformat mdy
 set datefirst 7
-set transaction isolation level #{@getIsolationLevelText @config.options.connectionIsolationLevel}"""
+set transaction isolation level #{@getIsolationLevelText @config.options.connectionIsolationLevel}
+set xact_abort #{xact_abort}"""
 
   processedInitialSql: ->
       @clearConnectTimer()
@@ -767,6 +788,7 @@ set transaction isolation level #{@getIsolationLevelText @config.options.connect
       @request = request
       @request.rowCount = 0
       @request.rows = []
+      @request.rst = []
 
       @createRequestTimer()
 
